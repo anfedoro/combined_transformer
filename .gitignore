@@ -1,0 +1,7 @@
+data/*
+runs/*
+models/*
+_pycache_/*
+__pycache__/create_vocab.cpython-311.pyc
+__pycache__/nq_llm_decoder.cpython-311.pyc
+.DS_Store
