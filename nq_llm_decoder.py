@@ -19,50 +19,65 @@ last_model_path = ''
 log_dir = ''
 
 
-def data_prepare (candle_seq_len = 64):
+def data_prepare (candle_seq_len = 64, global_tokens = None):
         #load data from hdf5 file and create a dataset
-    with h5py.File("data/encoded_NQ_data_64.hdf5", "r") as f:
-        # total_records = f["data"].shape[0]
-        # start_index = int(total_records*0.60)
-        # stop_index = int(total_records*0.65)
-        # dataset = f["data"][start_index:stop_index]
+    
+    print(f'Loading data from hdf5 file...')
+    with h5py.File("data/encoded_NQ_data_vol_100.hdf5", "r") as f:
+    
         dataset = f["data"][:]
         dataset = torch.from_numpy(dataset).long()
     #load index to token map from json file
-    with open('data/NQ_idx_to_tok_64.json', 'r') as f:
+    with open('data/NQ_idx_to_tok_vol_100.json', 'r') as f:
         index_to_token = json.load(f)
     #convert keys to integers
     index_to_token = {int(k):v for k,v in index_to_token.items()}
-           
-        # for key in f.keys():
-        #     if key != "data":
-        #         group = f[key]
-        #         sizes = group['sizes'][:]
-        #         direction = group['direction'][()]
-        #         index_to_candle[int(key)] = {'sizes':tuple(sizes), 'direction':direction}
-        
+    vocab_size = max(index_to_token.keys())       
 
-    vocab_size = max(index_to_token.keys()) + 1
+    #calculate token weights
+
 
     token_freq = dataset.unique(return_counts=True)[1]
     weight = 1/token_freq ** 0.5
     token_weights = torch.zeros(len(weight)+1)
     token_weights[1:] = weight / weight.sum() * len(weight)
 
-    dataset = dataset.unfold(0, candle_seq_len, 1)
-    torch.manual_seed(42)
-    shaffle_idx = torch.randperm(dataset.shape[0])
-    dataset = dataset[shaffle_idx]
-
+    
     
 
+    torch.manual_seed(42)
+    
+    if global_tokens is not None:
+        print(f'Preparing data with additional {global_tokens} global tokens...')
+        dataset = (dataset.unfold(0, candle_seq_len + global_tokens + 1, 1)).clone()
+        dataset_len = dataset.shape[0]
+        #add global tokens
+        for i in range(global_tokens):
+            idx = vocab_size + 1 + i
+            dataset[:,i] = idx
+            index_to_token[idx] = f'<GLOB_{i}>'
 
-    input_dataset = dataset[:, :-1]
-    target_dataset = dataset[: , 1:]
+        vocab_size += global_tokens + 1
+        shaffle_idx = torch.randperm(dataset.shape[0])
+        dataset = dataset[shaffle_idx]
+
+        input_dataset = dataset[:, :-1]
+        target_dataset = dataset[: ,global_tokens + 1:]   
+        
+        
+    else:
+        print(f'Preparing data without global tokens...')
+        # unfold dataset to create input and target sequences
+        dataset = dataset.unfold(0, candle_seq_len + 1 , 1)
+        vocab_size += 1
+        shaffle_idx = torch.randperm(dataset.shape[0])
+        dataset = dataset[shaffle_idx]
+        input_dataset = dataset[:, :-1]
+        target_dataset = dataset[: , 1:]   
 
     print(f'Input dataset shape: {input_dataset.shape}, Target dataset shape: {target_dataset.shape}')
+    print(f'Splitting dataset to train and validation sets...')
 
-    torch.manual_seed(42)
     split_idx = int(len(dataset)*0.8)
     train_data = input_dataset[:split_idx]
     train_targets = target_dataset[:split_idx]
@@ -224,7 +239,7 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 class AutoregressionDecoderModel(nn.Module):
-    def __init__(self, vocab_size, seq_len, embed_dim, num_heads, num_layers, dropout=0.1, ff_mult=4):
+    def __init__(self, vocab_size, seq_len, embed_dim, num_heads, num_layers, dropout=0.1, ff_mult=4, global_tokens=None):
         super(AutoregressionDecoderModel, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0,)
         self.pos_encoder = nn.Embedding(seq_len, embed_dim, padding_idx=0) 
@@ -232,6 +247,7 @@ class AutoregressionDecoderModel(nn.Module):
         self.decoder_layer = nn.TransformerDecoderLayer(embed_dim, num_heads, embed_dim*ff_mult, dropout, batch_first=True)
         self.decoder = nn.TransformerDecoder(self.decoder_layer, num_layers)
         self.output_layer = nn.Linear(embed_dim, vocab_size)
+        self.global_tokens = global_tokens
         
         self.embed_dim = embed_dim
         self.apply(self._init_weights)
@@ -261,12 +277,15 @@ class AutoregressionDecoderModel(nn.Module):
         tgt_mask = tgt_mask.to(src.device)
         output = self.decoder(x, x, tgt_mask=tgt_mask)
         output = self.output_layer(output)
-
+        if self.global_tokens != None:
+            output = output[:, self.global_tokens :,:-self.global_tokens]
+        else:
+            output = output[:,1:,:]
         return output
 
 
 #check if we have CUDA or MPS and setup respecive device, if not CUDA nor MPS is available, then use CPU
-def init_model(vocab_size, seq_len, embed_dim, num_heads, num_layers, dropout, ff_mult=4):
+def init_model(vocab_size, seq_len, embed_dim, num_heads, num_layers, dropout, ff_mult=4, global_tokens=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')
 
     #if CUDA enable TF32
@@ -279,7 +298,7 @@ def init_model(vocab_size, seq_len, embed_dim, num_heads, num_layers, dropout, f
     print(f"Device to be used: {device}")
     #Initialize model
     torch.manual_seed(42)
-    model = AutoregressionDecoderModel(vocab_size, seq_len, embed_dim, num_heads, num_layers, dropout, ff_mult)
+    model = AutoregressionDecoderModel(vocab_size, seq_len, embed_dim, num_heads, num_layers, dropout, ff_mult, global_tokens=global_tokens)
 
     model = model.to(device)
     next(model.parameters()).device
@@ -320,7 +339,7 @@ def restore_model(model, optimizer, scaler, path, device):
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    #scaler.load_state_dict(checkpoint['scaler']) if scaler is not None else None
+    scaler.load_state_dict(checkpoint['scaler'])
     vocab_size = checkpoint['vocab_size']
     embed_dim = checkpoint['embed_dim']
     num_heads = checkpoint['num_heads']
@@ -331,12 +350,12 @@ def restore_model(model, optimizer, scaler, path, device):
     best_accuracy = checkpoint['accuracy']
     epoch = checkpoint['epoch']
     writers = checkpoint['writers']
-    return epoch, model, optimizer, vocab_size, embed_dim, num_heads, num_layers, dropout, best_vloss,best_loss, best_accuracy, writers
+    return  model, optimizer, scaler, epoch, vocab_size, embed_dim, num_heads, num_layers, dropout, best_vloss,best_loss, best_accuracy, writers
 
 def get_leaning_rates(embed_dim, warmup_steps, num_epochs):
     l_rates = []
     for epoch in range(num_epochs):
-        lr = embed_dim ** (-2) * min((epoch+1) ** (-0.5), (epoch+1)*warmup_steps**(-1.5)) 
+        lr = embed_dim ** (-1.5) * min((epoch+1) ** (-0.5), (epoch+1)*warmup_steps**(-1.5)) * 0.2
         if epoch > int(warmup_steps) and epoch % 10 in range(0,5):
             lr = lr * 1
         l_rates.append(lr)
@@ -356,7 +375,7 @@ def store_model(model, optimizer, scaler, path, epoch, vocab_size, embed_dim, nu
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
-                    #'scaler': scaler.state_dict() if scaler is not None else None,
+                    'scaler': scaler.state_dict(),
                     'vocab_size': vocab_size,
                     'embed_dim': embed_dim,
                     'num_heads': num_heads,
@@ -421,20 +440,23 @@ def train(model, optimizer, scaler, loss_fn, train_loader, val_loader, writer, d
                 data = data.to(device)
                 labels = labels.to(device)
                 optimizer.zero_grad(set_to_none=True)
-                #with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+                with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
                     # Forward pass
-                outputs = model(data)
+                    outputs = model(data)
 
+                
                     #loss calculation
-                loss = loss_fn(outputs.view(-1, vocab_size), labels.view(-1))
+                    loss = loss_fn(outputs.reshape(-1, outputs.shape[2]), labels.view(-1))
 
                 epoch_loss += loss.item()
 
                 # Backward and optimize
                 
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                scaler.step(optimizer)
+                scaler.update()
                 
-                loss.backward()
-                optimizer.step()
 
                 tic = time.perf_counter() - toc
                 data_len += data.shape[0]
@@ -461,6 +483,9 @@ def train(model, optimizer, scaler, loss_fn, train_loader, val_loader, writer, d
                         writer.add_histogram(f'biases/{name}', param, epoch)
                     if param.grad is not None:
                         writer.add_histogram(f'grads/{name}', param.grad, epoch)
+                
+                embeding_weights = model.embedding.weight.detach()
+                writer.add_embedding(embeding_weights,global_step=epoch)
                     
 
             print(' '*len(str_), end='\r', flush=True)
@@ -476,17 +501,17 @@ def train(model, optimizer, scaler, loss_fn, train_loader, val_loader, writer, d
                     
                     vdata = vdata.to(device)
                     vlabels = vlabels.to(device)
-                    #with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
-                    # Forward pass
-                    voutputs = model(vdata)
-                    #loss calculation
-                    vloss = loss_fn(voutputs.view(-1, vocab_size), vlabels.view(-1))
-                    last_redicted_candle = voutputs.softmax(dim=2).argmax(dim=2)
-                    last_actual_candle = vlabels
-                    correct += (last_redicted_candle == last_actual_candle).sum().item()
-                    total += last_actual_candle.numel()
-                    accuracy = correct / total * 100
-                
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
+                        # Forward pass
+                        voutputs = model(vdata)
+                        #loss calculation
+                        vloss = loss_fn(voutputs.reshape(-1, outputs.shape[2]), vlabels.view(-1))
+                        last_redicted_candle = voutputs.softmax(dim=2).argmax(dim=2)
+                        last_actual_candle = vlabels
+                        correct += (last_redicted_candle == last_actual_candle).sum().item()
+                        total += last_actual_candle.numel()
+                        accuracy = correct / total * 100
+                    
                     vepoch_loss += vloss.item()
 
                     #calculate accuracy
@@ -540,12 +565,12 @@ def train(model, optimizer, scaler, loss_fn, train_loader, val_loader, writer, d
                 vlabels_text = []
                 for i in range(vout_tockens.shape[0]):
                     vout_text.append(index_to_candle[vout_tockens[i].item()])
-                    if epoch == 0:
-                        vlabels_text.append(index_to_candle[vlabels[i].item()])
+                    #if epoch == 0:
+                    vlabels_text.append(index_to_candle[vlabels[i].item()])
                 #write to tensorboard
                 writer.add_text('Predicted sequence', ' '.join(vout_text), epoch)
-                if epoch == 0:
-                    writer.add_text('Target sequence', ' '.join(vlabels_text), epoch)
+                #if epoch == 0:
+                writer.add_text('Target sequence', ' '.join(vlabels_text), epoch)
 
 
             
@@ -557,7 +582,7 @@ def train(model, optimizer, scaler, loss_fn, train_loader, val_loader, writer, d
 
 
             # #write charts to tensorboard
-            if epoch % 5 == 0:
+            if epoch % 2 == 0:
             #     write_predictions(writer, model, vdata, voutputs, epoch, index_to_candle)
                 decode_and_write(writer, model, vlabels[0].cpu(), voutputs[0], epoch, index_to_candle)
                 
@@ -582,12 +607,21 @@ def train(model, optimizer, scaler, loss_fn, train_loader, val_loader, writer, d
                 
             
             writer.flush()
+        is_exeption = False
 
     except KeyboardInterrupt:
         print(f"Interrupted at epoch {epoch}")
+        is_exeption = True
+
+    except Exception as e:
+        print(f"Exception at epoch {epoch}: {e}")
+        is_exeption = True
+
     finally:
         time_since_start = int(time.perf_counter() - start_time)
         formatted_time = f'{time_since_start//3600:02d}:{(time_since_start//60)%60:02d}:{time_since_start%60:02d}'
+        if not is_exeption:
+            epoch += 1
 
         store_model(model, optimizer, scaler, last_model_path, epoch, vocab_size, embed_dim, num_heads, num_layers, dropout, best_vloss, best_loss, best_accuracy, writer)
         writer.close()
@@ -598,21 +632,28 @@ def train(model, optimizer, scaler, loss_fn, train_loader, val_loader, writer, d
 def main():
     
     #load data
-    batch_size = 64
-    seq_len = 128
-    vocab_size, train_inputs, val_inputs, train_targets, val_targets, index_to_candle, token_weights = data_prepare(candle_seq_len=seq_len+1)
+    batch_size = 1024*2
+    seq_len = 64
+    global_tokens = 4
+    
+
+    vocab_size, train_inputs, val_inputs, train_targets, val_targets, index_to_candle, token_weights = data_prepare(candle_seq_len=seq_len, global_tokens=global_tokens)
 
     
     
     continue_training = False
     is_best = False
-
     
+    
+    #initialize data loaders
+
 
     global max_train_batches 
     global max_val_batches
-    max_train_batches = (train_inputs.shape[0] + batch_size - 1) // batch_size // 80
-    max_val_batches = (val_inputs.shape[0] + batch_size - 1) // batch_size // 10
+    max_train_batches = (train_inputs.shape[0] + batch_size - 1) // batch_size // 1
+    max_val_batches = (val_inputs.shape[0] + batch_size - 1) // batch_size // 1
+
+    print(f'Train batches: {max_train_batches}, Validation batches: {max_val_batches}, Batch size: {batch_size}')
 
     train_loader = BatchIterator(batch_size, max_train_batches, train_inputs, train_targets, shuffle=True)
     val_loader = BatchIterator(batch_size, max_val_batches, val_inputs, val_targets, shuffle=False)
@@ -620,35 +661,34 @@ def main():
     global best_model_path
     global last_model_path
     global log_dir
-    best_model_path = './models/nq-llm_decoder_bpe64_best.pth'
-    last_model_path = './models/nq-llm_decoder_bpe64_last.pth'
-    log_dir = 'runs/nq_llm_decoder_bpe64'
+    best_model_path = './models/nq-llm_decoder_bpe_vol_100_best.pth'
+    last_model_path = './models/nq-llm_decoder_bpe_vol_100_last.pth'
+    log_dir = 'runs/nq_llm_decoder_bpe_vol_100'
 
     #initialize hyperparameters
     hp = {'start_epoch':0, 
             'num_epochs':1000,
             'warmup_steps':50, 
             'vocab_size': vocab_size, 
-            'embed_dim':16, 
+            'embed_dim':64, 
             'num_heads':8, 
-            'num_layers':6, 
+            'num_layers':8, 
             'dropout':0.1, 
             'ff_mult':4,
-            'seq_len': seq_len, 
+            'seq_len': seq_len if global_tokens is None else seq_len + global_tokens, 
             'best_vloss':float('inf'),
             'best_loss':float('inf'),
             'best_accuracy':0
            }
 
     #initialize model, loss function and optimizer
-    model, device = init_model(hp['vocab_size'], hp['seq_len'], hp['embed_dim'], hp['num_heads'], hp['num_layers'], hp['dropout'], hp['ff_mult'])
+    model, device = init_model(hp['vocab_size'], hp['seq_len'], hp['embed_dim'], hp['num_heads'], hp['num_layers'], hp['dropout'], hp['ff_mult'], global_tokens=global_tokens )
     
-    scaler = torch.cuda.amp.GradScaler(enabled=True) if device == torch.device('cuda') else None
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
     
-
-
     
-    optimizer = optim.Adam(model.parameters(), lr=1e-6) 
+    #optimizer = optim.SGD(model.parameters(), lr=1e-6, momentum=0.5)
+    optimizer = optim.Adam(model.parameters(), lr=1e-6)
    
     if continue_training:
         #load model from checkpoint
@@ -656,7 +696,7 @@ def main():
 
         print(f'Loading model from checkpoint {load_path}')
       
-        epoch, model, optimizer, vocab_size, embed_dim, num_heads, num_layers, dropout, best_vloss, best_loss, best_accuracy, writers = restore_model(model, optimizer,scaler, load_path,device)
+        model, optimizer, scaler, epoch, vocab_size, embed_dim, num_heads, num_layers, dropout, best_vloss, best_loss, best_accuracy, writers = restore_model(model, optimizer, scaler, load_path, device)
         print(f'The best model loaded from checkpoint. Epoch: {epoch+1}, Best train loss: {RED}{best_loss:.6f}{RESET}, Best validation loss: {RED}{best_vloss:.6f}{RESET}, Best accuracy: {RED}{best_accuracy:.2f}%{RESET}')
 
         #update hyperparameters
@@ -665,12 +705,17 @@ def main():
         hp['best_loss'] = best_loss
         hp['best_accuracy'] = best_accuracy
         purge_step = epoch if is_best else None
+        
+        #optimizer = optim.SGD(model.parameters(), lr=1e-6, momentum=0.9) 
+        #optimizer = optim.Adam(model.parameters(), lr=1e-6)
+        
+
     else:
         purge_step = None
         writers = None
 
     print(f'Model hyperparameters are:\nVocab_size: {hp["vocab_size"]},\tSeq_len: {hp["seq_len"]},\tEmbed_dim: {hp["embed_dim"]}\nNum_heads: {hp["num_heads"]},\tNum_layers: {hp["num_layers"]},\tDropout: {hp["dropout"]}, FF_mult: {hp["ff_mult"]}')
-    
+    print(f'Optimizerto be used is {type(optimizer)}')
     count_parameters(model)
 
     token_weights = token_weights.to(device)
